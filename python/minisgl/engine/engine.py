@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -50,6 +51,11 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+
+        # INT8 + INT4 weight quantization for decode GEMV acceleration
+        from minisgl.kernel.quantize import quantize_model_weights
+        quantize_model_weights(self.model, use_int4=True, int4_group_size=128)
+        logger.info_rank0("INT8+INT4 weight quantization applied (all decoder layers + lm_head)")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -108,6 +114,10 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
+
+        # Persistent forward kernel disabled - cooperative groups approach too slow
+        # (75 tok/s vs 840 baseline due to 128 threads/block GEMV limitation)
+        self._persistent_fwd = None
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -190,16 +200,47 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        graph_next_tokens = None
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
+            if self._persistent_fwd is not None and batch.is_decode and batch.size == 1:
+                logits = self._persistent_fwd.run(batch)
+            elif self.graph_runner.can_use_cuda_graph(batch):
+                logits, graph_next_tokens = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
 
         for req in batch.reqs:
             req.complete_one()
 
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        # Use graph-captured argmax for greedy sampling (avoids extra kernel launch)
+        if graph_next_tokens is not None and args.temperatures is None:
+            next_tokens_gpu = graph_next_tokens
+        else:
+            next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def forward_batch_multistep(
+        self, batch: Batch, args: BatchSamplingArgs, step_out_locs: torch.Tensor,
+        num_steps: int,
+    ) -> ForwardOutput:
+        """Run multi-step CUDA graph: num_steps forward passes in one replay."""
+        assert torch.cuda.current_stream() == self.stream
+        assert batch.size == 1 and args.temperatures is None  # greedy only
+
+        with self.ctx.forward_batch(batch):
+            logits, step_tokens = self.graph_runner.replay_multistep(
+                batch, step_out_locs
+            )
+
+        # Advance req state by num_steps
+        for req in batch.reqs:
+            for _ in range(num_steps):
+                req.complete_one()
+
+        next_tokens_gpu = step_tokens  # shape [num_steps]
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -220,7 +261,7 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        backend = "fi" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 

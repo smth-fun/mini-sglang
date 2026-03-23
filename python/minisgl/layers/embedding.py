@@ -95,7 +95,19 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+        # Use INT4 Triton GEMV for bs=1 decode (quarters lm_head memory traffic)
+        w_int4 = getattr(self, 'weight_int4', None)
+        w_scale_int4 = getattr(self, 'weight_scale_int4', None)
+        w_int8 = getattr(self, 'weight_int8', None)
+        w_scale = getattr(self, 'weight_scale', None)
+        if x.shape[0] == 1 and w_int4 is not None and self.bias is None:
+            from minisgl.kernel.triton_gemv_int4 import triton_gemv_int4
+            logits = triton_gemv_int4(x, w_int4, w_scale_int4, group_size=128)
+        elif x.shape[0] == 1 and w_int8 is not None and self.bias is None:
+            from minisgl.kernel.triton_gemv import triton_gemv
+            logits = triton_gemv(x, w_int8, weight_scale=w_scale)
+        else:
+            logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape

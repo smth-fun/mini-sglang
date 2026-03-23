@@ -48,8 +48,53 @@ class AttentionLayer(StateLessOP):
         ctx = get_global_ctx()
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
-            self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
-        if self.k_norm is not None:
+            if qkv.shape[0] == 1:
+                backend = ctx.attn_backend
+                kvcache = ctx.kv_cache
+                k_cache = kvcache.k_cache(self.layer_id).view(kvcache._storage_shape)
+                v_cache = kvcache.v_cache(self.layer_id).view(kvcache._storage_shape)
+
+                # Fused QKNorm + RoPE + KV store + Split-K attention (1 kernel instead of 3)
+                if getattr(backend, '_use_splitk', False):
+                    from minisgl.kernel.fused_qknorm_attn import fused_qknorm_splitk_attention_forward
+                    o = fused_qknorm_splitk_attention_forward(
+                        qkv,
+                        self.q_norm.weight, self.k_norm.weight,
+                        self.rotary._cos_sin_cache,
+                        ctx.batch.positions, ctx.batch.out_loc,
+                        k_cache, v_cache,
+                        backend._splitk_page_indices,
+                        backend._splitk_seq_len,
+                        self.num_qo_heads, self.num_kv_heads, self.head_dim,
+                        backend._splitk_sm_scale,
+                        self.q_norm.eps,
+                        backend._splitk_partial_out,
+                        backend._splitk_partial_lse,
+                        backend._splitk_out,
+                        backend._splitk_q_scratch,
+                        backend._splitk_head_counter,
+                    )
+                    return o.view(-1, self.qo_attn_dim)
+
+                # Fallback: separate QKNorm + RoPE + KV store, then attention
+                from minisgl.kernel.fused_qk_rope import fused_qk_norm_rope_store
+                fused_qk_norm_rope_store(
+                    qkv.view(-1),
+                    self.q_norm.weight, self.k_norm.weight,
+                    self.rotary._cos_sin_cache,
+                    ctx.batch.positions, ctx.batch.out_loc,
+                    k_cache, v_cache,
+                    self.q_norm.eps,
+                    self.num_qo_heads, self.num_kv_heads, self.head_dim,
+                )
+                q = q.view(-1, self.num_qo_heads, self.head_dim)
+                o = backend.forward(q, k, v, self.layer_id, ctx.batch, skip_store=True)
+                return o.view(-1, self.qo_attn_dim)
+            else:
+                self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
+                if self.k_norm is not None:
+                    self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+        elif self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)

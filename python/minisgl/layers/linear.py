@@ -5,9 +5,24 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.kernel.triton_gemv import triton_gemv, _should_use_triton, _get_config
 from minisgl.utils import div_even
 
 from .base import BaseOP
+
+
+def _fast_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, weight_int8: torch.Tensor | None = None, weight_scale: torch.Tensor | None = None, weight_int4: torch.Tensor | None = None, weight_scale_int4: torch.Tensor | None = None) -> torch.Tensor:
+    """Use Triton GEMV for bs=1 decode where it's faster, cuBLAS otherwise."""
+    if x.shape[0] == 1 and bias is None:
+        # Prefer INT4 over INT8 for maximum bandwidth reduction
+        if weight_int4 is not None and _should_use_triton(weight.shape[1], weight.shape[0]):
+            from minisgl.kernel.triton_gemv_int4 import triton_gemv_int4
+            return triton_gemv_int4(x, weight_int4, weight_scale_int4, group_size=128)
+        if weight_int8 is not None and _should_use_triton(weight.shape[1], weight.shape[0]):
+            return triton_gemv(x, weight_int8, weight_scale=weight_scale)
+        if _should_use_triton(weight.shape[1], weight.shape[0]):
+            return triton_gemv(x, weight)
+    return F.linear(x, weight, bias)
 
 
 class _LinearTPImpl(BaseOP):
@@ -29,7 +44,11 @@ class _LinearTPImpl(BaseOP):
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return _fast_linear(x, self.weight, self.bias,
+                            getattr(self, 'weight_int8', None),
+                            getattr(self, 'weight_scale', None),
+                            getattr(self, 'weight_int4', None),
+                            getattr(self, 'weight_scale_int4', None))
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -100,7 +119,11 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = _fast_linear(x, self.weight, self.bias,
+                         getattr(self, 'weight_int8', None),
+                         getattr(self, 'weight_scale', None),
+                         getattr(self, 'weight_int4', None),
+                         getattr(self, 'weight_scale_int4', None))
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -121,7 +144,11 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = _fast_linear(x, self.weight, self.bias,
+                         getattr(self, 'weight_int8', None),
+                         getattr(self, 'weight_scale', None),
+                         getattr(self, 'weight_int4', None),
+                         getattr(self, 'weight_scale_int4', None))
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

@@ -35,6 +35,7 @@ class GatedMLP(BaseOP):
         if act_fn is None:
             raise ValueError(f"Unsupported activation function: {config.hidden_act}")
         self.act_fn = act_fn
+        self._use_fused_silu = (config.hidden_act == "silu")
         self.down_proj = LinearRowParallel(
             config.intermediate_size,
             config.hidden_size,
@@ -43,6 +44,12 @@ class GatedMLP(BaseOP):
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fused path: gate_up GEMV + silu_and_mul in one kernel for bs=1
+        if self._use_fused_silu and x.shape[0] == 1:
+            from minisgl.kernel.fused_gemv_silu import fused_gemv_silu_and_mul
+            y = fused_gemv_silu_and_mul(x, self.gate_up_proj.weight)
+            return self.down_proj.forward(y)
+
         gate_up = self.gate_up_proj.forward(x)
         del x
         y = self.act_fn(gate_up)
@@ -119,6 +126,11 @@ class RopeAttn(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         qkv = self.qkv_proj.forward(x)
         del x
+        o = self.attn.forward(qkv)
+        return self.o_proj.forward(o)
+
+    def forward_post_qkv(self, qkv: torch.Tensor) -> torch.Tensor:
+        """Forward pass starting from pre-computed QKV (skips qkv_proj)."""
         o = self.attn.forward(qkv)
         return self.o_proj.forward(o)
 

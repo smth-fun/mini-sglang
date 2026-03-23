@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 from minisgl.core import Batch, Req
+from minisgl.engine.graph import NUM_MULTI_STEPS
 from minisgl.env import ENV
 from minisgl.message import (
     AbortBackendMsg,
@@ -143,25 +144,46 @@ class Scheduler(SchedulerIOMixin):
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
-        with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+        num_steps = getattr(batch, 'num_steps', 1)
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    self.cache_manager.cache_req(req, finished=False)
+        with self.cache_manager.lazy_free_region():
+            if num_steps > 1:
+                # Multi-step: next_tokens_cpu has shape [num_steps] for bs=1
+                req = batch.reqs[0]
+                for step in range(num_steps):
+                    next_token = next_tokens_cpu[step]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token_val = int(next_token.item())
+                    finished = not req.can_decode
+                    if not req.sampling_params.ignore_eos:
+                        finished |= next_token_val == self.eos_token_id
+                    reply.append(DetokenizeMsg(
+                        uid=req.uid, next_token=next_token_val, finished=finished
+                    ))
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                        break
+            else:
+                for i, req in enumerate(batch.reqs):
+                    if isinstance(req, ChunkedReq):
+                        continue
+                    next_token = next_tokens_cpu[i]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token = int(next_token.item())
+                    finished = not req.can_decode
+                    if not req.sampling_params.ignore_eos:
+                        finished |= next_token == self.eos_token_id
+                    reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+
+                    # NOTE: overlap scheduling may make the request freed twice, skip second free
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
+                        self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
@@ -203,7 +225,48 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
+
+        # Check multi-step eligibility: bs=1, greedy, decode, enough remain_len
+        num_steps = 1
+        if (
+            batch.is_decode
+            and batch.size == 1
+            and self.engine.graph_runner.has_multistep
+            and batch.reqs[0].sampling_params.is_greedy
+            and batch.reqs[0].remain_len >= NUM_MULTI_STEPS
+        ):
+            num_steps = NUM_MULTI_STEPS
+
+        if num_steps > 1:
+            req = batch.reqs[0]
+            orig_device_len = req.device_len
+            # Temporarily extend device_len to allocate pages for all steps
+            req.device_len = req.cached_len + num_steps
+            self.cache_manager.allocate_paged([req])
+            req.device_len = orig_device_len  # restore for step 0 metadata
+
+            # Get step_out_locs from page table
+            step_out_locs = self.engine.page_table[
+                req.table_idx, req.cached_len : req.cached_len + num_steps
+            ].clone()
+
+            # Compute multi-step write positions for token pool
+            ms_table_idxs = torch.full(
+                (num_steps,), req.table_idx, dtype=torch.int64, device=self.device
+            )
+            ms_write_pos = torch.arange(
+                orig_device_len, orig_device_len + num_steps,
+                dtype=torch.int64, device=self.device,
+            )
+
+            # Store multi-step metadata on batch
+            batch.num_steps = num_steps
+            batch.step_out_locs = step_out_locs
+            batch.multi_write_tuple = (ms_table_idxs, ms_write_pos)
+        else:
+            batch.num_steps = 1
+            self.cache_manager.allocate_paged(batch.reqs)
+
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -227,8 +290,17 @@ class Scheduler(SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+
+        num_steps = getattr(batch, 'num_steps', 1)
+        if num_steps > 1:
+            forward_output = self.engine.forward_batch_multistep(
+                batch, sample_args, batch.step_out_locs, num_steps
+            )
+            self.token_pool[batch.multi_write_tuple] = forward_output.next_tokens_gpu
+        else:
+            forward_output = self.engine.forward_batch(batch, sample_args)
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
