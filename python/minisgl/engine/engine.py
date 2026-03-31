@@ -53,9 +53,13 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # INT8 + INT4 weight quantization for decode GEMV acceleration
-        from minisgl.kernel.quantize import quantize_model_weights
-        quantize_model_weights(self.model, use_int4=True, int4_group_size=128)
-        logger.info_rank0("INT8+INT4 weight quantization applied (all decoder layers + lm_head)")
+        import os
+        if os.environ.get("DISABLE_QUANT", "0") != "1":
+            from minisgl.kernel.quantize import quantize_model_weights
+            quantize_model_weights(self.model, use_int4=True, int4_group_size=128)
+            logger.info_rank0("INT8+INT4 weight quantization applied (all decoder layers + lm_head)")
+        else:
+            logger.info_rank0("Quantization DISABLED via DISABLE_QUANT=1")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)

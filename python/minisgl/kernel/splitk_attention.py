@@ -91,7 +91,7 @@ def _reduce_attn_kernel(
 
 # Pre-computed constants for Qwen3-0.6B
 _BLOCK_SEQ = 128
-_NUM_CHUNKS_PAD = 16  # covers up to 2048 tokens (128 * 16)
+_NUM_CHUNKS_PAD = 32  # covers up to 4096 tokens (128 * 32)
 
 
 def splitk_attention_forward(

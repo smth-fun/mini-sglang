@@ -52,4 +52,6 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        import os
+        port = os.environ.get("DIST_PORT", "2333")
+        return f"tcp://127.0.0.1:{port}"

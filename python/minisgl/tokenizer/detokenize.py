@@ -68,6 +68,24 @@ class DetokenizeManager:
         self.eos_token_id = self.tokenizer.eos_token_id
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # When the same uid appears multiple times in one batch (multi-step decode),
+        # the two-pass loop below produces incorrect results because surr_offset and
+        # read_offset are only updated in pass 2. Fall back to one-at-a-time processing.
+        uids = set()
+        has_duplicate = False
+        for msg in msgs:
+            if msg.uid in uids:
+                has_duplicate = True
+                break
+            uids.add(msg.uid)
+        if has_duplicate:
+            results: List[str] = []
+            for msg in msgs:
+                results.extend(self._detokenize_batch([msg]))
+            return results
+        return self._detokenize_batch(msgs)
+
+    def _detokenize_batch(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
@@ -90,6 +108,9 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+            if msg.uid not in self.decode_map:
+                incremental_strs.append("")
+                continue
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status

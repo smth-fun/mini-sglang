@@ -157,7 +157,8 @@ class GraphRunner:
             self.graph_map[bs] = graph
 
         # Capture multi-step graph for bs=1 greedy decode
-        if 1 in self.graph_bs_list and self.attn_backend._use_splitk:
+        import os
+        if os.environ.get("DISABLE_QUANT", "0") != "1" and 1 in self.graph_bs_list and self.attn_backend._use_splitk:
             self._capture_multistep(model, pool)
 
         free_memory = get_free_memory(self.device)
