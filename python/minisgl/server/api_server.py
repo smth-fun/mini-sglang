@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -188,6 +189,16 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
+    async def collect_chat_completions(self, uid: int) -> str:
+        """Collect all streamed tokens into a single string for non-streaming responses."""
+        full_text = ""
+        async for ack in self.wait_for_ack(uid):
+            if ack.incremental_output:
+                full_text += ack.incremental_output
+            if ack.finished:
+                break
+        return full_text
+
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         try:
             async for chunk in generator:
@@ -278,10 +289,22 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         )
     )
 
-    return StreamingResponse(
-        state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
-        media_type="text/event-stream",
-    )
+    if req.stream:
+        return StreamingResponse(
+            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            media_type="text/event-stream",
+        )
+    else:
+        full_text = await state.collect_chat_completions(uid)
+        return JSONResponse({
+            "id": f"cmpl-{uid}",
+            "object": "chat.completion",
+            "choices": [{
+                "message": {"role": "assistant", "content": full_text},
+                "index": 0,
+                "finish_reason": "stop",
+            }],
+        })
 
 
 @app.get("/v1/models")
